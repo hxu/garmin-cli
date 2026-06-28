@@ -691,22 +691,18 @@ impl SyncEngine {
 
     /// Count pending tasks by type and update progress
     ///
-    /// Sets initial totals based on actual tasks in queue.
-    /// GPX totals are updated dynamically as activities are discovered.
+    /// Sets initial totals based on actual tasks in the active queue. Activity
+    /// page and GPX totals are updated dynamically as more tasks are discovered.
     fn count_tasks_for_progress(&self, progress: &SyncProgress) -> Result<()> {
         // Count actual tasks by type from the queue
         let (activities, gpx, health, performance) = self.queue.count_by_type()?;
 
-        // Activities and GPX totals are set during planning from API discovery
-        // or restored from actual queue counts when resuming an interrupted sync.
-        if progress.activities.get_total() == 0 {
-            progress.activities.set_total(activities.max(1)); // At least 1 for pagination
-            progress.activities.set_dynamic(true);
-        }
-        if progress.gpx.get_total() == 0 {
-            progress.gpx.set_total(gpx);
-            progress.gpx.set_dynamic(true); // Will be discovered during sync
-        }
+        // Override any planning estimates so progress remains task-based:
+        // completed task count / discovered task count.
+        progress.activities.set_total(activities);
+        progress.activities.set_dynamic(true);
+        progress.gpx.set_total(gpx);
+        progress.gpx.set_dynamic(true);
 
         // Health and performance totals come from date range calculation
         progress.health.set_total(health);
@@ -782,8 +778,8 @@ impl SyncEngine {
         progress: &SyncProgress,
         today: NaiveDate,
     ) -> Result<()> {
-        // Find oldest activity date (this also gives us total count)
-        let (oldest_date, total_activities, estimated_gps) =
+        // Find oldest activity date.
+        let (oldest_date, _total_activities, _estimated_gps) =
             self.find_oldest_activity_date(Some(progress)).await?;
 
         // Get or initialize backfill frontier
@@ -821,7 +817,8 @@ impl SyncEngine {
         progress.set_backfill_range(&frontier_date.to_string(), &oldest_date.to_string());
         progress.set_oldest_activity_date(&oldest_date.to_string());
 
-        // Plan activity sync with known totals
+        // Plan the first activity page. More pages and GPX downloads are
+        // enqueued dynamically as activity pages are processed.
         if opts.sync_activities && !activities_complete {
             progress.set_planning_step(PlanningStep::PlanningActivities);
             self.plan_activities_sync(
@@ -829,10 +826,6 @@ impl SyncEngine {
                 Some(activity_from),
                 Some(activity_to),
             )?;
-            if total_activities > 0 {
-                progress.activities.set_total(total_activities);
-                progress.gpx.set_total(estimated_gps);
-            }
         }
 
         if opts.sync_health {
@@ -2689,12 +2682,46 @@ mod tests {
             .unwrap();
 
         let progress = SyncProgress::new();
+        progress.activities.set_total(1219);
+        progress.gpx.set_total(975);
+
         engine.count_tasks_for_progress(&progress).unwrap();
 
         assert_eq!(progress.activities.get_total(), 1);
         assert_eq!(progress.gpx.get_total(), 2);
         assert_eq!(progress.health.get_total(), 1);
         assert_eq!(progress.performance.get_total(), 1);
+    }
+
+    #[test]
+    fn test_count_tasks_for_progress_does_not_seed_missing_activity_work() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let storage = Storage::open(temp_dir.path().to_path_buf()).unwrap();
+        let engine = SyncEngine::with_storage(
+            storage,
+            GarminClient::new_with_base_url("http://localhost"),
+            test_token(),
+        )
+        .unwrap();
+
+        engine
+            .queue
+            .push(SyncTask::new(
+                engine.profile_id,
+                SyncPipeline::Backfill,
+                SyncTaskType::DailyHealth {
+                    date: NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+                },
+            ))
+            .unwrap();
+
+        let progress = SyncProgress::new();
+        engine.count_tasks_for_progress(&progress).unwrap();
+
+        assert_eq!(progress.activities.get_total(), 0);
+        assert_eq!(progress.gpx.get_total(), 0);
+        assert_eq!(progress.health.get_total(), 1);
+        assert_eq!(progress.performance.get_total(), 0);
     }
 
     #[test]
